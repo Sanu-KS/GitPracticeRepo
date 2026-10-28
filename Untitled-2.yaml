@@ -1,0 +1,414 @@
+
+name: Lambda Pytest, Sonar Scan & S3 Deployment
+
+# ======================================
+# Global Configuration
+# ======================================
+env:
+  DEFAULT_LAMBDA: "VR"
+  AWS_REGION: "eu-central-1"
+  AWS_ROLE: "arn:aws:iam::263789222982:role/dev-10250-cxf-write-eu"
+  S3_BUCKET: "tcp-aws-ted-dev-edpp-raw-kokoro-eu-central-1"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+# ======================================
+# Workflow Triggers
+# ======================================
+on:
+  push:
+    branches:
+      - "**"
+
+  pull_request:
+    branches:
+      - "**"
+
+  workflow_dispatch:
+    inputs:
+      lambda_function:
+        description: "Select Lambda Function to Deploy"
+        required: true
+        default: "VR"
+        type: choice
+        options:
+          - SBC
+          - DOWNLOAD
+          - DCR
+          - VR
+
+# ======================================
+# Jobs
+# ======================================
+jobs:
+
+  # ======================================
+  # Determine Environment and Lambda
+  # ======================================
+  determine-env:
+    runs-on: ubuntu-latest
+
+    outputs:
+      env_dir: ${{ steps.set-env.outputs.env_dir }}
+      selected_lambda: ${{ steps.set-env.outputs.selected_lambda }}
+      is_deployable: ${{ steps.set-env.outputs.is_deployable }}
+
+    steps:
+      - name: Determine Environment and Deployment Eligibility
+        id: set-env
+        env:
+          SELECTED_INPUT: ${{ inputs.lambda_function || env.DEFAULT_LAMBDA }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Determine target environment
+          if [ "${GITHUB_REF_NAME}" = "SIT" ]; then
+            ENV_DIR="sit"
+          else
+            ENV_DIR="develop"
+          fi
+
+          echo "env_dir=${ENV_DIR}" >> "$GITHUB_OUTPUT"
+
+          # Select Lambda function
+          TARGET="${SELECTED_INPUT}"
+
+          case "$TARGET" in
+            SBC|DOWNLOAD|DCR|VR)
+              echo "selected_lambda=${TARGET}" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unsupported Lambda: ${TARGET}"
+              exit 1
+              ;;
+          esac
+
+          echo "Selected Lambda: ${TARGET}"
+          echo "Selected environment: ${ENV_DIR}"
+
+          # Decide whether deployment is permitted
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] || \
+             { [ "${GITHUB_EVENT_NAME}" = "push" ] && \
+               { [ "${GITHUB_REF_NAME}" = "develop" ] || \
+                 [ "${GITHUB_REF_NAME}" = "SIT" ]; }; }; then
+
+            echo "is_deployable=true" >> "$GITHUB_OUTPUT"
+            echo "Deployment is enabled."
+          else
+            echo "is_deployable=false" >> "$GITHUB_OUTPUT"
+            echo "Tests only; deployment is disabled."
+          fi
+
+  # ======================================
+  # Unit Tests, Coverage and Deployment
+  # ======================================
+  unit_tests_and_deploy:
+    needs: determine-env
+    runs-on: ubuntu-latest
+
+    steps:
+      # ======================================
+      # Checkout Repository
+      # ======================================
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ======================================
+      # Python Setup
+      # ======================================
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      # ======================================
+      # Install Test Dependencies
+      # ======================================
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov coverage requests
+
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      # ======================================
+      # Run Pytest and Generate Coverage
+      # ======================================
+      - name: Run Pytest Unit Tests
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p reports
+          export PYTHONPATH=.
+
+          coverage run --parallel-mode -m pytest -v lambda/tests
+          coverage combine
+          coverage xml -o reports/coverage.xml
+          coverage report
+
+      # ======================================
+      # Upload Coverage Report
+      # ======================================
+      - name: Upload Coverage Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: reports/coverage.xml
+          if-no-files-found: ignore
+
+      # ======================================
+      # SonarQube Scan - Currently Disabled
+      # ======================================
+      # - name: SonarQube Scan
+      #   uses: SonarSource/sonarqube-scan-action@v6
+      #   env:
+      #     SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      #     SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      #   with:
+      #     args: >
+      #       -Dsonar.projectName=KOKORO-MDM-IH-CAPABILITIES
+      #       -Dsonar.sources=lambda/src
+      #       -Dsonar.tests=lambda/tests
+      #       -Dsonar.python.version=3.10
+      #       -Dsonar.python.coverage.reportPaths=reports/coverage.xml
+
+      # ======================================
+      # Resolve Lambda and S3 Metadata
+      # ======================================
+      - name: Resolve Lambda Metadata
+        if: needs.determine-env.outputs.is_deployable == 'true'
+        env:
+          ENV_DIR: ${{ needs.determine-env.outputs.env_dir }}
+          TARGET: ${{ needs.determine-env.outputs.selected_lambda }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ======================================
+          # Select Environment Configuration
+          # ======================================
+          if [ "$ENV_DIR" = "sit" ]; then
+            S3_BASE_PREFIX="kokoro-capabilities-git-deployment-sit"
+          else
+            S3_BASE_PREFIX="kokoro-capabilities-git-development-dev"
+          fi
+
+          # ======================================
+          # Map Lambda Metadata
+          # S3 folder names do not include -SIT
+          # ======================================
+          case "$TARGET" in
+            SBC)
+              S3_FOLDER="MDM-Kokoro-SBC"
+              SRC_FILE="search_before_create.py"
+              ;;
+            DOWNLOAD)
+              S3_FOLDER="MDM-Kokoro-Download"
+              SRC_FILE="download_api.py"
+              ;;
+            DCR)
+              S3_FOLDER="MDM-Kokoro-DCR"
+              SRC_FILE="dcr_submission_lambda.py"
+              ;;
+            VR)
+              S3_FOLDER="MDM-Kokoro-VR"
+              SRC_FILE="dcr_validation_lambda.py"
+              ;;
+            *)
+              echo "Unsupported Lambda: $TARGET"
+              exit 1
+              ;;
+          esac
+
+          # ======================================
+          # Resolve Actual AWS Lambda Name
+          # ======================================
+          if [ "$ENV_DIR" = "sit" ]; then
+            FUNC_NAME="${S3_FOLDER}-SIT"
+            ENV_FILE="env/sit/${FUNC_NAME}.env"
+          else
+            FUNC_NAME="$S3_FOLDER"
+            ENV_FILE="env/develop/${FUNC_NAME}.env"
+          fi
+
+          # ======================================
+          # Validate Required Files
+          # ======================================
+          if [ ! -f "lambda/src/${SRC_FILE}" ]; then
+            echo "Source file not found: lambda/src/${SRC_FILE}"
+            exit 1
+          fi
+
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "Environment file not found: $ENV_FILE"
+            exit 1
+          fi
+
+          # Export metadata for subsequent steps
+          {
+            echo "FUNC_NAME=${FUNC_NAME}"
+            echo "SRC_FILE=${SRC_FILE}"
+            echo "ENV_FILE=${ENV_FILE}"
+            echo "S3_BASE_PREFIX=${S3_BASE_PREFIX}"
+            echo "S3_FOLDER=${S3_FOLDER}"
+          } >> "$GITHUB_ENV"
+
+          echo "Target Lambda: ${FUNC_NAME}"
+          echo "Source file: ${SRC_FILE}"
+          echo "Environment file: ${ENV_FILE}"
+          echo "S3 prefix: ${S3_BASE_PREFIX}/${S3_FOLDER}"
+
+      # ======================================
+      # Authenticate to AWS using OIDC
+      # ======================================
+      - name: Configure AWS Credentials
+        if: needs.determine-env.outputs.is_deployable == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ======================================
+      # Package, Upload to S3 and Deploy
+      # ======================================
+      - name: Build and Deploy Selected Lambda
+        if: needs.determine-env.outputs.is_deployable == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Deploying: ${FUNC_NAME}"
+
+          # ======================================
+          # Build Deployment Package
+          # ======================================
+          rm -rf package deployment.zip
+          mkdir -p package
+
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt -t package/
+          fi
+
+          cp "lambda/src/${SRC_FILE}" package/
+
+          # Include shared package if it exists.
+          # Change this path if your common folder is elsewhere.
+          COMMON_DIR="lambda/common"
+
+          if [ -d "$COMMON_DIR" ]; then
+            cp -R "$COMMON_DIR" package/
+          else
+            echo "No common folder found at ${COMMON_DIR}; verify whether shared code is required."
+          fi
+
+          # Create ZIP
+          (
+            cd package
+            zip -r ../deployment.zip .
+          )
+
+          # ======================================
+          # Upload ZIP to Environment-Specific S3
+          # ======================================
+          S3_KEY="${S3_BASE_PREFIX}/${S3_FOLDER}/deployment.zip"
+
+          echo "Uploading deployment package to S3."
+
+          aws s3 cp deployment.zip \
+            "s3://${S3_BUCKET}/${S3_KEY}" \
+            --region "${AWS_REGION}"
+
+          # ======================================
+          # Deploy Lambda Code from S3
+          # ======================================
+          aws lambda update-function-code \
+            --function-name "${FUNC_NAME}" \
+            --s3-bucket "${S3_BUCKET}" \
+            --s3-key "${S3_KEY}" \
+            --region "${AWS_REGION}"
+
+          aws lambda wait function-updated \
+            --function-name "${FUNC_NAME}" \
+            --region "${AWS_REGION}"
+
+          echo "Lambda code deployment completed."
+
+          # ======================================
+          # Merge Existing and Repository Variables
+          # ======================================
+          # Existing Lambda variables are preserved.
+          # Values in the repository ENV_FILE override
+          # existing values with the same key.
+          aws lambda get-function-configuration \
+            --function-name "${FUNC_NAME}" \
+            --query 'Environment.Variables' \
+            --output json \
+            --region "${AWS_REGION}" > current-env.json
+
+          python - "${ENV_FILE}" current-env.json merged-env.json <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          env_file, current_file, output_file = sys.argv[1:]
+
+          current = json.loads(Path(current_file).read_text() or "{}")
+          if not isinstance(current, dict):
+              current = {}
+
+          configured = {}
+
+          for raw_line in Path(env_file).read_text().splitlines():
+              line = raw_line.strip()
+
+              if not line or line.startswith("#"):
+                  continue
+
+              if "=" not in line:
+                  raise SystemExit(
+                      f"Invalid environment configuration line: {line.split('=')[0]}"
+                  )
+
+              key, value = line.split("=", 1)
+              key = key.strip()
+              value = value.strip()
+
+              if not key:
+                  raise SystemExit("Environment variable name cannot be empty.")
+
+              configured[key] = value
+
+          merged = {**current, **configured}
+
+          Path(output_file).write_text(
+              json.dumps({"Variables": merged})
+          )
+          PY
+
+          # ======================================
+          # Apply Environment Variables
+          # ======================================
+          aws lambda update-function-configuration \
+            --function-name "${FUNC_NAME}" \
+            --environment file://merged-env.json \
+            --region "${AWS_REGION}"
+
+          aws lambda wait function-updated \
+            --function-name "${FUNC_NAME}" \
+            --region "${AWS_REGION}"
+
+          rm -f current-env.json merged-env.json
+
+          echo "Environment variables updated successfully."
+          echo "Deployment completed for ${FUNC_NAME}."
