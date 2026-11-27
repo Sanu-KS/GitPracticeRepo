@@ -1,0 +1,62 @@
+name: Databricks Repo Sync
+
+on:
+  push:
+    branches:
+      - develop
+      - SIT
+      - test
+      - "feature/**"
+  workflow_dispatch:
+
+# One sync at a time per target environment (not per branch)
+concurrency:
+  group: databricks-sync-${{ (github.ref_name == 'test' && 'test') || (github.ref_name == 'SIT' && 'sit') || 'dev' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    # develop and feature/** -> dev, SIT -> sit, test -> test
+    environment: >-
+      ${{ github.ref_name == 'test' && 'test'
+       || github.ref_name == 'SIT'  && 'sit'
+       || 'dev' }}
+
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      # OAuth (recommended). For a PAT, remove these two lines
+      # and uncomment DATABRICKS_TOKEN below.
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      # DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      REPO_PATH: ${{ vars.DATABRICKS_REPO_PATH }}
+      BRANCH: ${{ github.ref_name }}
+
+    steps:
+      - name: Check required settings
+        run: |
+          if [ -z "$DATABRICKS_HOST" ]; then echo "DATABRICKS_HOST secret is missing"; exit 1; fi
+          if [ -z "$REPO_PATH" ]; then echo "DATABRICKS_REPO_PATH variable is missing"; exit 1; fi
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@v0.230.0
+
+      - name: Sync Databricks repo to the branch
+        run: |
+          echo "Updating $REPO_PATH to branch $BRANCH"
+          databricks repos update "$REPO_PATH" --branch "$BRANCH"
+
+      - name: Verify the deployed commit
+        run: |
+          DEPLOYED=$(databricks repos get "$REPO_PATH" -o json | jq -r '.head_commit_id')
+          echo "Deployed commit: $DEPLOYED"
+          echo "Expected commit: ${{ github.sha }}"
+          if [ "$DEPLOYED" != "${{ github.sha }}" ]; then
+            echo "Commit mismatch: Databricks is not on the latest commit"
+            exit 1
+          fi
