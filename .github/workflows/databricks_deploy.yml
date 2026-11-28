@@ -34,7 +34,7 @@ jobs:
       DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
       DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
       # DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-      REPO_PATH: /Workspace/Users/sanuthumbakkani@gmail.com/GitPracticeRepo
+      REPO_PATH: ${{ vars.DATABRICKS_REPO_PATH }}
       BRANCH: ${{ github.ref_name }}
 
     steps:
